@@ -1,0 +1,367 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[16]:
+
+
+import osmnx as ox
+import numpy as np
+import pandas as pd
+from rapidfuzz import process
+import time
+import geocoder
+from geopy.exc import GeocoderTimedOut
+
+import networkx as nx
+import osmnx as ox
+from pyrosm import OSM
+
+import pickle
+
+import geopandas as gpd
+import folium 
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# In[25]:
+
+
+def calculate_mean_coordinate(row):
+    #m = MultiLineString()
+    x, y = row['geometry'].centroid.x, row['geometry'].centroid.y
+    return (y, x)
+
+def carica_dati_comuni(geojson_file):
+    #comuni https://github.com/openpolis/geojson-italy
+    #geojson_file = r"data\limits_IT_municipalities.geojson"
+    comuni = gpd.read_file(geojson_file)
+    comuni = comuni[['name', 'prov_name', 'reg_name', 'geometry']]
+    #calcolo area comuni
+    for_area = comuni.copy()
+    for_area = for_area.to_crs({'init': 'epsg:32633'})
+    comuni['area'] = (for_area['geometry'].area/ 10**6).round(4)
+    return comuni
+
+def carica_dati_province(geojson_file):
+    #province
+    #geojson_file = r"data\limits_IT_provinces.geojson"
+    province = gpd.read_file(geojson_file)
+    province = province[['prov_name', 'reg_name', 'geometry']]
+    #calcolo area comuni
+    for_area = province.copy()
+    for_area = for_area.to_crs({'init': 'epsg:32633'})
+    province['area'] = (for_area['geometry'].area/ 10**6).round(4)
+    return province
+
+def get_aggregazione_comuni_con_filtro(searchfor):
+    networks = ['network_NE', 'network_NO', 'network_C', 'network_NE', 'network_I', 'network_S']
+    #searchfor = ['Pietro Nenni', 'Giorgio Amendola', 'Ugo La Malfa', "Alcide De Gasperi", 'Ugo la Malfa', "Alcide de Gasperi",
+    #            "Meuccio Ruini", "Alessandro Casati"]
+
+    total_comuni_grouped = pd.DataFrame(columns=["comune", 'prov_name', 'reg_name', "n_filtrate", "n_streets"])
+    for network in networks:
+        streets = pd.read_pickle("./"+network+".pkl") 
+        streets = streets[['name','geometry', 'length']]
+        streets['mean_coordinate'] = streets.apply(calculate_mean_coordinate, axis=1)
+        streets['filter'] = streets['name'].str.contains('|'.join(searchfor), case=False)
+        #faccio diventare mean_coordinate un geometry
+        gdf_streets = gpd.GeoDataFrame(streets,  geometry=gpd.points_from_xy(streets.mean_coordinate.str[1], streets.mean_coordinate.str[0]))
+        #metto in join con i comuni sulla base dell'appartenza geografica 
+        sjoined_streets = gpd.sjoin(gdf_streets, comuni, predicate="within")
+        #levo i duplicati delle strade dovute alle biforcazioni
+        sjoined_streets = sjoined_streets.sort_values(['length'], ascending=False)
+        sjoined_streets = sjoined_streets.drop_duplicates(subset=['name_left', 'name_right', 'prov_name','reg_name'], keep='first')
+        #sjoined_streets
+        comuni_grouped = sjoined_streets.groupby(['name_right', 'prov_name', 'reg_name'])['filter'].agg(['sum','count']).reset_index()
+        comuni_grouped.columns = ["comune", 'prov_name', 'reg_name', "n_filtrate", "n_streets"]
+        #comuni_grouped
+        total_comuni_grouped = pd.concat([total_comuni_grouped, comuni_grouped]).reset_index(drop=True)
+    return total_comuni_grouped
+
+def calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni):
+    vie_per_comune = comuni.merge(total_comuni_grouped, left_on=['name', 'prov_name', 'reg_name'], right_on=['comune', 'prov_name', 'reg_name'], how="left")
+    #vie_per_comune['listings_count'] = vie_per_comune['listings_count'].fillna(0)
+    # vie_per_comune
+    gpd_geo_comuni = vie_per_comune[["name", "prov_name", "reg_name", "geometry", "area", "n_filtrate", "n_streets"]]
+    gpd_geo_comuni["n_streets-over-area"] = (gpd_geo_comuni["n_streets"] / gpd_geo_comuni["area"]).astype(float).round(4)
+    gpd_geo_comuni["n_filtrate-over-area"] = (gpd_geo_comuni["n_filtrate"] / gpd_geo_comuni["area"]).astype(float).round(4)
+    gpd_geo_comuni["n_filtrate-over-n_streets"] = (gpd_geo_comuni["n_filtrate"]*100 / gpd_geo_comuni["n_streets"]).astype(float).round(4)
+    
+    gpd_geo_comuni.columns = ['Comune', 'Provincia', 'Regione', 'geometry', 'Superficie', 
+                            'Vie di interesse', 'Vie totali', 'Vie per km^2', 
+                            'Vie per di interesse km^2', 'Percentuale vie di interesse']
+    return gpd_geo_comuni, vie_per_comune
+
+def calcola_metriche_province_in_gdp(vie_per_comune, province):
+    vie_per_provincia = vie_per_comune.groupby(['prov_name', 'reg_name'])['n_filtrate', 'n_streets'].apply(lambda x : x.sum()).reset_index()
+    #vie_per_provincia
+    gpd_geo_province = pd.merge(vie_per_provincia, province,  how='right', left_on=['prov_name','reg_name'], right_on = ['prov_name','reg_name'])
+    gpd_geo_province = gpd_geo_province[["prov_name", "reg_name", "geometry", "area", "n_filtrate", "n_streets"]]
+    gpd_geo_province["n_streets-over-area"] = (gpd_geo_province["n_streets"] / gpd_geo_province["area"]).astype(float).round(4)
+    gpd_geo_province["n_filtrate-over-area"] = (gpd_geo_province["n_filtrate"] / gpd_geo_province["area"]).astype(float).round(4)
+    gpd_geo_province["n_filtrate-over-n_streets"] = (gpd_geo_province["n_filtrate"]*100 / gpd_geo_province["n_streets"]).astype(float).round(4)
+    gpd_geo_province.columns = ['Provincia', 'Regione', 'geometry', 'Superficie', 
+                            'Vie di interesse', 'Vie totali', 'Vie per km^2', 
+                            'Vie per di interesse km^2', 'Percentuale vie di interesse']
+    gpd_geo_province = gpd.GeoDataFrame(gpd_geo_province)
+    return gpd_geo_province, vie_per_provincia
+
+def ottieni_grafico(gpd_geo_province, descrizione, metrica, cmap="RdPu"):
+    #colori gradazione intensità https://matplotlib.org/stable/tutorials/colors/colormaps.html
+    m = gpd_geo_province.explore(metrica, cmap=cmap, 
+                                 vmin = 0, vmax = 9,
+                                 tiles="CartoDB positron",
+                                 width = 900, height = 800,
+                                 zoom_start=6,
+                                )
+
+    # https://stackoverflow.com/questions/74267926/folium-map-title-disappearing-when-activating-fullscreen-mode
+    from branca.element import Template, MacroElement
+    template = """
+    {% macro html(this, kwargs) %}
+
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Densità Toponomastica</title>
+      <link rel="stylesheet" href="//code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css">
+    </head>
+
+    <body>
+    <div id='maplegend' class='maplegend' 
+        style='position: absolute; z-index:9999; border:3px solid grey; background-color:rgba(255, 255, 255, 0.7);
+        border-radius:6px; padding: 8px; font-size:18px; bottom: 3%; left: 1%; width: 25%'>
+
+    <div class='title-box'>
+    <div class='main-title'>Densità toponomastica provinciale</div>
+    <div class='subtitle'>"""+descrizione+"""</div>
+
+    <style type='text/css'>
+      .title-box .main-title {
+        text-align: left;
+        margin-bottom: 8px;
+        font-weight: bold;
+        font-size: 100%;
+        }
+      .title-box .subtitle {
+        text-align: left;
+        margin-bottom: 8px;
+        font-weight: normal;
+        font-size: 75%;
+        }
+    </style>
+    </body>
+
+    {% endmacro %}"""
+
+    macro = MacroElement()
+    macro._template = Template(template)
+    m.get_root().add_child(macro)
+    return m
+
+
+
+# In[26]:
+
+
+'''
+from html2image import Html2Image
+hti = Html2Image()
+hti.screenshot(
+    html_file='province_resistenza.html', save_as='province_resistenza.png',
+    size=(1920, 1080)
+)
+'''
+
+
+# In[19]:
+
+
+geojson_comuni = r"data\limits_IT_municipalities.geojson"
+geojson_province = r"data\limits_IT_provinces.geojson"
+
+comuni = carica_dati_comuni(geojson_comuni)
+province = carica_dati_province(geojson_province)
+
+
+# In[28]:
+
+
+#ANTIFASCISMO E RESISTENZA
+descrizione = "Protagonisti dell'antifascismo e della resistenza"
+searchfor = ["25 Aprile", "XXV Aprile", "Venticinque Aprile",
+             'Pietro Nenni', 'Giorgio Amendola', 'Ugo La Malfa', "Alcide De Gasperi", 'Ugo la Malfa', "Alcide de Gasperi",
+            "Meuccio Ruini", "Alessandro Casati",
+            "Anna Maria Enriques Agnoletti",  "Mario Alicata",  "Mario Allegretti",  "Filippo Amedeo",  "Giorgio Amendola",  "Pietro Amendola",  "Aldo Aniasi",  "Tina Anselmi",  "Quirino Armellini",  "Rinaldo Arnaldi",  "Vito Artale",  "Walter Audisio",  "Arnaldo Azzi",  "Piero Balbo",  "Marcella Balconi",  "Irma Bandiera",  "Guglielmo Barbò",  "Aligi Barducci",  "Enrico Bartoletti",  "Giorgio Bassani",  "Lelio Basso",  "Pier Luigi Bellini delle Stelle",  "Filippo Beltrami",  "Enrico Berlinguer",  "Enzo Biagi",  "Dante Livio Bianco",  "Gino Bibbi",  "Giorgio Bocca",  "Vittore Bocchetta",  "Giuseppe Boffa",  "Mike Bongiorno",  "Ivanoe Bonomi",  "Alfeo Brandimarte",  "Gianni Brera",  "Manlio Brosio",  "Pietro Bucalossi",  "Ignazio Buttitta",  "Salvatore Calabrese",  "Eugenio Calò",  "Italo Calvino",  "Marcello Candia",  "Raffaele Cantoni",  "Carla Capponi",  "Giorgio Caproni",  "Nicolò Carandini",  "Terzilio Cardinali",  "Bruno Caruso",  "Carlo Cassola",  "Maddalena Cerasuolo",  "Angelo Cerica",  "Cervi Brothers",  "Alba de Céspedes",  "Gerardo Chiaromonte",  "Felice Chilanti",  "Pietro Chiodi",  "Carlo Azeglio Ciampi",  "Francesca Ciceri",  "Alessandra Codazzi",  "Pompeo Colajanni",  "Laura Conti",  "Giuseppe Cordero Lanza di Montezemolo",  "Armando Cossutta",  "Gaetano Costa",  "Carlo Croce",  "Eugenio Curiel",  "Alcide De Gasperi",  "Nerina De Walderstein",  "Amilcare Debar",  "Angelo Del Boca",  "Alfredo Di Dio",  "Paolo Caccia Dominioni",  "Carlo Donat-Cattin",  "Giuseppe Dossetti",  "Renato Dulbecco",  "Bruno Fanciullacci",  "Beppe Fenoglio",  "Dardano Fenulli",  "Antonio Ferri",  "Aldo Finzi",  "Antonio Fonda Savio",  "Giovanni Fornasini",  "Ugo Forno",  "Loris Fortuna",  "Eduino Francini",  "Duccio Galimberti",  "Leopoldo Gasparotto",  "Aldo Gastaldi",  "Pierino Gelmini",  "Sem Ghelardini",  "Maurizio Giglio",  "Antonio Giolitti",  "Ada Gobetti",  "Angela Gotelli",  "Carlo Grassi",  "Antonio Greppi",  "Luigi Gui",  "Renato Guttuso",  "Ursula Hirschmann",  "Pietro Ingrao",  "Nilde Iotti",  "Gualtiero Jacopetti",  "Trentino La Barba",  "Ugo La Malfa",  "Urbano Lazzaro",  "Riccardo Lombardi",  "Luigi Longo",  "Roberto Lucifero d'Aprigliano",  "Folco Lulli",  "Giorgina Madìa",  "Alfredo Malgeri",  "Augusto Mancini",  "Renato Marchiaro",  "Giovanni Marcora",  "Alberto Marenco di Moriondo",  "Giorgio Marincola",  "Calogero Marrone",  "Mario Martinelli",  "Enrico Martini",  "Umberto Mastroianni",  "Enrico Mattei",  "Teresa Mattei",  "Primo Mazzolari",  "Lidia Menapace",  "Luigi Meneghello",  "Umberto Meoli",  "Lina Merlin",  "Liana Millu",  "Stefanina Moro",  "Giuseppe Morosini",  "Cino Moscatelli",  "Alberto Murer",  "Mario Musolesi",  "Giorgio Napolitano",  "Alessandro Natta",  "Pietro Nenni",  "Bruno Neri",  "Luigi Nono",  "Teresio Olivelli",  "Giancarlo Pajetta",  "Pietro Pappagallo",  "Ferruccio Parri",  "Cesare Pavese",  "Claudio Pavone",  "Aurelio Peccei",  "Sandro Pertini",  "Antonio Pesenti",  "Costanzo Picco",  "Guido Picelli",  "Carlo Pinna",  "Alfredo Pizzoni",  "Felice Platone",  "Ludwig-Karl Ratschiller",  "Placido Rizzotto",  "Agostino Rocca",  "Gianni Rodari",  "Pier Luigi Romita",  "Auro Roselli",  "Rossana Rossanda",  "Maria Maddalena Rossi",  "Roberto Roversi",  "Claudia Ruggerini",  "Tigrino Sabatini",  "Carlo Salinari",  "Massimo Salvadori",  "Costantino Salvi",  "Giuseppe Saragat",  "Mauro Scoccimarro",  "Rosa Chiarina Scolari",  "Enrico Silvestri",  "Giuseppe Siri",  "Willi Sitte",  "Rodolfo Siviero",  "Edgardo Sogno",  "Giuseppe Soncini",  "Giovanni Spagnolli",  "Altiero Spinelli",  "Aldo Stella",  "Adriano Tardelli",  "Paolo Emilio Taviani",  "Umberto Terracini",  "Palmiro Togliatti",  "Diana Torrieri",  "Aldo Tortorella",  "Tosca Bucarelli Martini",  "Ernesto Treccani",  "Bruno Trentin",  "Ettore Troilo",  "Giuseppina Tuissi",  "Mario Uggeri",  "Teo Usuelli",  "Raf Vallone",  "Ferruccio Valobra",  "Lelio Vittorio Valobra",  "Franco Venturi",  "Ignazio Vian",  "Adolfo Vigorelli",  "Sebastiano Visconti Prasca",  "Elio Vittorini",  "Giuseppe Di Vittorio",  "Benigno Zaccagnini",
+            "Giustina Abbà",  "Sibilla Aleramo",  "Giulio Alessio",  "Enrichetta Alfieri",  "Corrado Alvaro",  "Giorgio Amendola",  "Giovanni Amendola",  "Pietro Amendola",  "Antonio Cieri",  "Ludovico D'Aragona",  "Marcella Balconi",  "Ilio Barontini",  "August Bellanca",  "Bortolo Belotti",  "Enzo Biagi",  "Bianca Bianchi",  "Dante Livio Bianco",  "Gino Bibbi",  "Norberto Bobbio",  "Giorgio Bocca",  "Ivanoe Bonomi",  "Aldo Braibanti",  "Lojze Bratuž",  "Luigi Cacciatore",  "Piero Calamandrei",  "Pietro Campilli",  "Antonio Canepa",  "Aldo Capitini",  "Carla Capponi",  "Giorgio Caproni",  "Carlo Caracciolo",  "Filippo Caracciolo",  "Nicola Caracciolo",  "Carlo Cassola",  "Maddalena Cerasuolo",  "Alba de Céspedes",  "Aurelio Chessa",  "Eugenio Chiesa",  "Felice Chilanti",  "Pietro Chiodi",  "Francesca Ciceri",  "Alessandra Codazzi",  "Laura Conti",  "Gaetano Costa",  "Tina Costa",  "Benedetto Croce",  "Eugenio Curiel",  "Virgilia D'Andrea",  "Alceste De Ambris",  "Lauro De Bosis",  "Alcide De Gasperi",  "Guido De Ruggiero",  "Severino Di Giovanni",  "Filippo Andrea VI Doria Pamphili",  "Luigi Einaudi",  "Luigi Fabbri",  "Oriana Fallaci",  "Los Fastidios",  "Riccardo Fedel",  "Giangiacomo Feltrinelli",  "Beppe Fenoglio",  "Giacomo Ferrari",  "Guglielmo Ferrero",  "Gisella Floreanini",  "Piero Folli",  "Spartaco Fontano",  "Formazioni di difesa proletaria",  "Francesco Fantin",  "Carlo Francovich",  "Pier Giorgio Frassati",  "Vincenzo Galetti",  "Duccio Galimberti",  "Luigi Galleani",  "Giuseppe Garibaldi II",  "Aldo Garòsci",  "Leopoldo Gasparotto",  "Alfonso Gatto",  "Egidio Gennari",  "Leone Ginzburg",  "Natalia Ginzburg",  "Giuseppe Girotti",  "Piero Gobetti",  "Carmine Gorga",  "Antonio Gramsci",  "Antonio Graziadei",  "Nilde Iotti",  "Ugo La Malfa",  "Arturo Labriola",  "Edgardo Lami Starnuti",  "Chiara Lauvergnac",  "Giuseppe Lazzati",  "Pietro Leoni",  "Carlo Levi",  "Primo Levi",  "Gino Lucetti",  "Emilio Lussu",  "Joyce Lussu",  "Mario Mafai",  "Errico Malatesta",  "Fosco Maraini",  "Giorgio Marincola",  "Calogero Marrone",  "Piero Martinetti",  "Quinto Martini",  "Massimo Mila",  "Giacomo Matteotti",  "Josef Mayr-Nusser",  "Mazzini Society",  "Ugo Mazzucchelli",  "Egidio Meneghetti",  "Alberto Meschi",  "Giovanni Minzoni",  "Eugenio Montale",  "Indro Montanelli",  "Augusto Monti",  "Rodolfo Morandi",  "Ugo Morin",  "Cino Moscatelli",  "Giorgio Napolitano",  "Pietro Nenni",  "Bruno Neri",  "Francesco Fausto Nitti",  "Renzo Novatore",  "Teresio Olivelli",  "Italo Oxilia",  "Randolfo Pacciardi",  "Giuseppe Pagano",  "Mario Pannunzio",  "Vincenzo Pappalettera",  "Ferruccio Parri",  "Pier Paolo Pasolini",  "Cesare Pavese",  "Sandro Pertini",  "Antonio Pesenti",  "Dino Philipson",  "Guido Picelli",  "Giovanni Pieraccini",  "Michele De Pietro",  "Giovanni Battista Pinardi",  "Guido Piovene",  "Valentino Pittoni",  "Renato Poggioli",  "Vasco Pratolini",  "Leda Rafanelli",  "Antonietta Raphael",  "Emidio Recchioni",  "Gianni Rodari",  "Fernando de Rosa",  "Auro Roselli",  "Amelia Pincherle Rosselli",  "Carlo Rosselli",  "Nello Rosselli",  "Maria Maddalena Rossi",  "Giovanni Roveda",  "Claudia Ruggerini",  "Maria Rygier",  "Zeno Saltini",  "Gaetano Salvemini",  "Giuseppe Saragat",  "Oscar Luigi Scalfaro",  "Lea Schiavi",  "Raffaele Schiavina",  "Alfredo Ildefonso Schuster",  "Mauro Scoccimarro",  "Rosa Chiarina Scolari",  "Pietro Secchia",  "Argo Secondari",  "Matilde Serao",  "Stefano Siglienti",  "Velio Spano",  "Altiero Spinelli",  "Vittorio Staccione",  "Luigi Sturzo",  "Francesco Maria Taliani de Marchio",  "Alberto Tarchiani",  "Paolo Emilio Taviani",  "Massimo Teglio",  "Umberto Terracini",  "Walkiria Terradura",  "Adriano Tilgher",  "Palmiro Togliatti",  "Carlo Tresca",  "Ettore Troilo",  "Filippo Turati",  "Pio Turroni",  "Leo Valiani",  "Ferruccio Valobra",  "Renata Viganò",  "Ezio Vigorelli",  "Tullio Vinay",  "Elio Vittorini",  "Mario Zagari",  "Andrea Zanzotto",  "Bruno Zevi",  "Carmelo Zito",
+            "Filippo Turati",  "Benedetto Croce",  "Gaetano Salvemini",  "Alcide De Gasperi",  "Giovanni Amendola",  "Giacomo Matteotti",  "Piero Calamandrei",  "Antonio Gramsci",  "Pietro Nenni",  "Palmiro Togliatti",  "Sandro Pertini",  "Carlo Rosselli",  "Teresa Noce",  "Piero Gobetti",  "Altiero Spinelli",  "Francesco Saverio Nitti",  "Luigi Sturzo",  "Giuseppe Donati",  "Arturo Labriola",  "Carlo Emanuele a Prato",  "Giustina Abbà",  "Ottavio Abbati",  "Luigi Abbiati",  "Filippo Abignente jr",  "Alberto Acquacalda",  "Gaetano Afeltra",  "Giuseppe Agnello",  "Ferdinando Agnini",  "Giorgio Agosti",  "Vittorio Albarin",  "Giuseppe Albasini Scrosati",  "Guglielmo Alberganti",  "Vando Alberti",  "Giulio Aldrovandi",  "Gino Alessio",  "Enrichetta Alfani",  "Vittorio Alfieri",  "Enzo Alfieri",  "Barbara Allason",  "Massimiliano Aloisi",  "Adelaide Amendola",  "Carlo Ametis",  "Mario Andrei",  "Mario Andreis",  "Carlo Angela",  "Carla Angelini",  "Mario Angeloni",  "Lazzaro Anticoli",  "Mario Antoni",  "Alberto Apollonio",  "Vincenzo Arangio-Ruiz",  "Ettore Archinti",  "Dante Armanetti",  "Mario Artali",  "Filippo Asaro",  "Salvatore Auria",  "Massimo Avanzini",  "Giuseppe Aventi",  "Francesco Babini",  "Sauro Babini",  "Vincenzo Baccalà",  "Ulisse Bacci",  "Angelo Bacigalupi",  "Claudio Baglietto",  "Ugo Baglivo",  "Angelica Balabanoff",  "Vincenzo Baldazzi",  "Zeffirino Ballardini",  "Antonio Banfi",  "Arturo Baranzini",  "Giovanni Barbareschi",  "Tommaso Barbieri",  "Norma Barbolini",  "Achille Barilatti",  "Eugenio Baroni",  "Ilio Baroni",
+            "Cino Moscatelli",  "Enrico Martini Mauri",  "Arrigo Boldrini",  "Felice Cascione",  "Nuto Revelli",  "Francesco Ruﬃni",  "Mario Carrara",  "Lionello Venturi",  "Gaetano De Sanctis",  "Piero Martinetti",  "Bartolo Nigrisoli",  "Ernesto Buonaiuti",  "Giorgio Errera",  "Vito Volterra",  "Giorgio Levi della Vida",  "Edoardo Ruﬃni Avondo",  "Fabio Luzzatto",  "Renato Boragine",  "Guido D’Alonzo",  "Agide Maccari",  "Adelio Panizza",  "Guglielmo Simi",  "Dario Volpi",  "Primo Burastero",  "Giovanni Fugassa",  "Emilio Fugassa",  "Giorgio Amendola",  "Ada Gobetti",  "Ferruccio Parri",  "Luigi Longo",  "Giuseppe Di Vittorio",  "Giuseppe Saragat",  "Ugo La Malfa",  "Giuseppe Basso",  "Carlo Rosselli",  "Emilio Lussu",  "Ferruccio Parri",  "Luigi Longo",  "Giuseppe Di Vittorio",  "Giuseppe Saragat",  "Ugo La Malfa",  "Giuseppe Basso",  "Carlo Rosselli",  "Ada Gobetti",  "Fabio Luzzatto",  "Edoardo Ruﬃni Avondo",  "Renato Boragine",  "Guido D’Alonzo",  "Agide Maccari",  "Adelio Panizza",  "Guglielmo Simi",  "Dario Volpi",  "Primo Burastero",  "Giovanni Fugassa",  "Emilio Fugassa"]
+
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_resistenza.html')
+
+
+# In[29]:
+
+
+#RISORGIMENTO
+descrizione = "Protagonisti del risorgimento italiano"
+searchfor = ['Vittorio Emanuele', 'Cavour', 'Giuseppe Garibaldi', "Giuseppe Mazzini", 
+                         "Massimo d'Azeglio", "Daniele Manin", "Bandiera", "Carlo Pisacane",
+                        "Carlo Poerio", "Luigi Settembrini", "Rosolino Pilo",
+                        "Carlo Cattaneo", "Vincenzo Gioberti",
+                        "XX Settembre", "Venti Settembre", "20 Settembre"]
+
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_risorgimento.html')
+
+
+# In[30]:
+
+
+#SANTI e PAPI
+descrizione = "Santi"
+searchfor = ['San ', 'Santo ', 'Santa ', "Sant'", "Santi ", "Santissimo ", "Santissimi ", "Papa "]
+
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_santi.html')
+
+
+# In[31]:
+
+
+#SCIENZIATI ITALIANI
+descrizione = "Scienziati italiani"
+searchfor = ["Giovanni Dondi dell'Orologio",  "Jacopo Dondi dell'Orologio",  "Leonardo Fibonacci",  "Leon Battista Alberti",  "Benedetto Cotrugli",  "Leonardo da Vinci",  "Domenico Maria Novara",  "Vannoccio Biringuccio",  "Jacopo Berengario da Carpi",  "Paolo dal Pozzo Toscanelli",  "Piero Borgi",  "Francesco Maurolico",  "Ulisse Aldrovandi",  "Gaspare Aselli",  "Gerolamo Cardano",  "Bartolomeo Eustachi",  "Federico Commandino",  "Giacomo Antonio Cortuso",  "Andrea Cesalpino",  "Realdo Colombo",  "Costanzo Varolio",  "Gasparo Tagliacozzi",  "Girolamo Fracastoro",  "Luca Pacioli",  "Lodovico Ferrari",  "Luca Ghini",  "Aloysius Lilius",  "Gabriele Falloppio",  "Scipione del Ferro",  "Niccolò Fontana Tartaglia",  "Giambattista della Porta",  "Franciscus Patricius",  "Michele Mercati",  "Rafael Bombelli",  "Ignazio Danti",  "Hieronymus Fabricius",  "Leonardo Garzoni",  "Guidobaldo del Monte",  "Matteo Ricci",  "Giordano Bruno",  "Pietro Cataldi",  "Paolo Sarpi",  "Giovanni Antonio Magini",  "Fausto Veranzio",  "Antonio Filippo Ciucci",  "Giovanni Battista Riccioli",  "Sanctorius",  "Galileo Galilei",  "Federico Cesi",  "Eustachio Divini",  "Vincenzo Viviani",  "Gjuro Baglivi",  "Giovanni Alfonso Borelli",  "Giuseppe Campani",  "Giovanni Domenico Cassini",  "Bonaventura Cavalieri",  "Giacinto Cestoni",  "Giovanni Battista Hodierna",  "Niccolò Zucchi",  "Giovanni Battista Zupi",  "Elena Cornaro Piscopia",  "Antonio Vallisneri",  "Antonio Maria Valsalva",  "Evangelista Torricelli",  "Tito Livio Burattini",  "Francesco Stelluti",  "Marcello Malpighi",  "Francesco Maria Grimaldi",  "Geminiano Montanari",  "Giovanni Maria Lancisi",  "Bernardino Ramazzini",  "Francesco Redi",  "Luigi Ferdinando Marsili",  "Giovanni Ceva",  "Giovanni Girolamo Saccheri",  "Maria Gaetana Agnesi",  "Laura Bassi",  "Ruggiero Giuseppe Boscovich",  "Giuseppe Toaldo",  "Anna Morandi Manzolini",  "Giovanni Manzolini",  "Giovanni Battista Belzoni",  "Lazzaro Spallanzani",  "Giovanni Arduino (geologist)",  "Luigi Galvani",  "Joseph Louis Lagrange",  "Jacopo Riccati",  "Luigi Guido Grandi",  "Tiberius Cavallo",  "Giuseppe Piazzi",  "Carlo Amoretti",  "Pellegrino Turri",  "Alessandro Volta",  "Luigi Valentino Brugnatelli",  "Tommaso Campailla",  "Giuseppe Olivi",  "Amedeo Avogadro",  "Giovanni Battista Amici",  "Giulio Bizzozero",  "Leopoldo Marco Antonio Caldani",  "Temistocle Calzecchi-Onesti",  "Stanislao Cannizzaro",  "Giovanni Battista Brocchi",  "Antonio Cardarelli",  "Olinto De Pretto",  "Vincenzo Cerulli",  "Ernesto Cesàro",  "Agostino Codazzi",  "Gabrio Piola",  "Vincenzo Chiarugi",  "Francesco de Vico",  "Ulisse Dini",  "Giovanni Battista Donati",  "Angelo Dubini",  "Girolamo Segato",  "Francesco Faà di Bruno",  "Camillo Golgi",  "Giovanni Battista Grassi",  "Barnaba Oriani",  "Filippo Pacini",  "Antonio Pacinotti",  "Ferdinando Palasciano",  "Luigi Palmieri",  "Galileo Ferraris",  "Macedonio Melloni",  "Giuseppe Mercalli",  "Quirico Filopanti",  "Carlo Forlanini",  "Giuseppe Zamboni",  "Francesco Zantedeschi",  "Agostino Bassi",  "Giacomo Bresadola",  "Francesco Brioschi",  "Francesco Carlini",  "Giovanni Caselli",  "Orso Mario Corbino",  "Alfonso Giacomo Gaspare Corti",  "Domenico Cotugno",  "Alessandro Cruto",  "Giovanni Battista Morgagni",  "Angelo Mosso",  "Adelchi Negri",  "Leopoldo Nobili",  "Raffaele Piria",  "Giovanni Antonio Amedeo Plana",  "Emanuele Paternò",  "Giuseppe Peano",  "Gaetano Perusini",  "Arturo Issel",  "Vilfredo Pareto",  "Agostino Perini",  "Antonio Raimondi",  "Paolo Ruffini (mathematician)",  "Antonio Scarpa",  "Giovanni Schiaparelli",  "Angelo Secchi",  "Francesco Selmi",  "Enrico Sertoli",  "Ascanio Sobrero",  "Agostino Bassi",  "Vincenzo Tiberio",  "Gregorio Ricci-Curbastro",  "Augusto Righi",  "Scipione Riva-Rocci",  "Gian Domenico Romagnosi",  "Giovanni Battista Venturi",  "Carlo Fornasini",  "Francesco Siacci",  "Virginia Angiola Borrino",  "Giovanni Giorgi",  "Giuseppina Aliverti",  "Edoardo Amaldi",  "Silvano Arieti",  "Roberto Assagioli",  "Franco Basaglia",  "Fabio Badilini",  "Chiara Nappi",  "Enrico Bombieri",  "Claudio Bordignon",  "Giuseppe Brotzu",  "Nicola Cabibbo",  "Federico Capasso",  "Mario Capecchi",  "Antonio Carini",  "Ferdinando Castagnoli",  "Luigi Luca Cavalli-Sforza",  "Ugo Cerletti",  "Leon Croizat",  "Bruno de Finetti",  "Annibale de Gasparis",  "Corrado Giannantoni",  "Ennio de Giorgi",  "Franco Rasetti",  "Henry Salvatori",  "Renato Dulbecco",  "Federigo Enriques",  "Vittorio Erspamer",  "Enrico Fermi",  "Amarro Fiamberti",  "Guido Fubini",  "Agostino Gemelli",  "Riccardo Giacconi",  "Clelia Giacobini",  "Corrado Gini",  "Nicola Guarino",  "Rita Levi-Montalcini",  "Salvador Luria",  "Ettore Majorana",  "Bruno Pontecorvo",  "Massimo Marchiori",  "Guglielmo Marconi",  "Franco Modigliani",  "Maria Montessori",  "Giulio Natta",  "Giuseppe Occhialini",  "Pier Paolo Pandolfi",  "Giorgio Parisi",  "Giulio Racah",  "Bruno Rossi",  "Margherita Hack",  "Carlo Rovelli",  "Carlo Rubbia",  "Emilio Segrè",  "Nazareno Strampelli",  "Amelia Tonon",  "Carlo Urbani",  "Alessandro Vaciago",  "Gabriele Veneziano",  "Emilio Veratti",  "Vito Volterra",  "Antonino Zichichi",  "Enzo Paoletti",  "Fabiola Gianotti"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_scienziati.html')
+
+
+# In[32]:
+
+
+#MILITARI ITALIANI
+descrizione = "Militari italiani"
+searchfor = ["Armando Diaz",  "Pietro Badoglio",  "Enrico Caviglia",  "Luigi Cadorna",  "Emilio De Bono",  "Rodolfo Graziani",  "Ugo Cavallero",  "Giovanni Messe",  "Italo Balbo",  "Amedeo di Savoia-Aosta",  "Alessandro Pirzio Biroli",  "Mario Roatta",  "Vittorio Ambrosio",  "Giuseppe Castellano",  "Giorgio Carlo Calvi di Bergolo",  "Giovanni Gentile",  "Paolo Thaon di Revel",  "Luigi Rizzo",  "Costanzo Ciano",  "Angelo Iachino",  "Inigo Campioni",  "Carlo Bergamini",  "Luigi Sansonetti",  "Carlo De Simone",  "Junio Valerio Borghese",  "Luigi Durand de la Penne",  "Attilio Regolo",  "Gino Birindelli",  "Carlo Emanuele Buscaglia",  "Francesco Baracca",  "Fulco Ruffo di Calabria",  "Amedeo Guillet",  "Adriano Visconti",  "Teresio Martinoli",  "Franco Lucchini",  "Luigi Gorrini",  "Mario Visintini",  "Carlo Emanuele Buscaglia",  "Giovanni Bonet",  "Antonio Locatelli",  "Giuseppe Garibaldi",  "Armando Diaz",  "Pietro Badoglio",  "Enrico Caviglia",  "Luigi Cadorna",  "Emilio De Bono",  "Rodolfo Graziani",  "Ugo Cavallero",  "Giovanni Messe",  "Italo Balbo",  "Amedeo di Savoia-Aosta",  "Alessandro Pirzio Biroli",  "Mario Roatta",  "Vittorio Ambrosio",  "Giuseppe Castellano",  "Giorgio Carlo Calvi di Bergolo",  "Giovanni Gentile",  "Paolo Thaon di Revel",  "Luigi Rizzo",  "Costanzo Ciano",  "Angelo Iachino",  "Inigo Campioni",  "Carlo Bergamini",  "Luigi Sansonetti",  "Carlo De Simone",  "Junio Valerio Borghese",  "Luigi Durand de la Penne",  "Attilio Regolo",  "Gino Birindelli",  "Francesco Baracca",  "Fulco Ruffo di Calabria",  "Amedeo Guillet",  "Adriano Visconti",  "Teresio Martinoli",  "Franco Lucchini",  "Luigi Gorrini",  "Mario Visintini",  "Giovanni Bonet",  "Antonio Locatelli",  
+             "Luigi Cadorna",  "Armando Diaz",  "Pietro Badoglio",  "Enrico Caviglia",  "Rodolfo Graziani",  "Ugo Cavallero",  "Giovanni Messe",  "Italo Balbo",  "Amedeo di Savoia-Aosta",  "Vittorio Ambrosio",  "Giuseppe Castellano",  "Paolo Thaon di Revel",  "Luigi Rizzo",  "Angelo Iachino",  "Carlo Bergamini",  "Junio Valerio Borghese",  "Luigi Durand de la Penne",  "Attilio Regolo",  "Francesco Baracca",  "Fulco Ruffo di Calabria",  "Emilio De Bono",  "Giorgio Carlo Calvi di Bergolo",  "Giovanni Gentile",  "Costanzo Ciano",  "Inigo Campioni",  "Luigi Sansonetti",  "Carlo De Simone",  "Gino Birindelli",  "Carlo Emanuele Buscaglia",  "Amedeo Guillet",  "Adriano Visconti",  "Teresio Martinoli",  "Franco Lucchini",  "Luigi Gorrini",  "Mario Visintini",  "Giovanni Bonet",  "Antonio Locatelli",  "Giuseppe Garibaldi",  "Alessandro Pirzio Biroli",  "Mario Roatta",  "Giuseppe Castellano",  "Luigi Cadorna",  "Giuseppe Cordero Lanza di Montezemolo",  "Maurizio Giglio",  "Francesco De Pinedo",  "Italo Balbo",  "Arturo Ferrarin",  "Umberto Nobile",  "Amedeo I di Spagna",  "Giuseppe Amico",  "Alberto Agostini",  "Emo Agostini",  "Martino Aichner",  "Osvaldo Alasonatti",  "Giuseppe Albanese",  "Ruffo Pilo Albertelli",  "Gaetano Alberti",  "Aldo Alessandri",  "Antonino Alessi",  "Guido Alessi"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_militari.html')
+
+
+# In[ ]:
+
+
+#ARTISTI ITALIANI
+descrizione = "Artisti italiani"
+searchfor = ["Niccolò dell'Abbate",  "Giuseppe Abbati",  "Angiolo Achini",  "Pietro Adami",  "Livio Agresti",  "Giorgio Matteo Aicardi",  "Francesco Albani",  "Giacomo Alberelli",  "Mariotto Albertinelli",  "Ambrogio Antonio Alciati",  "Domenico Alfani",  "Girolamo Alibrandi",  "Silvio Allason",  "Alessandro Allori",  "Cristofano Allori",  "Marco Almaviva",  "Altichiero",  "Jaber Alwan",  "Jacopo Amigoni",  "Giuseppe Amisani",  "Andrea da Murano",  "Andrea di Bartolo",  "Fra Angelico",  "Sofonisba Anguissola",  "Pietro Annigoni",  "Andrea Ansaldo",  "Michelangelo Anselmi",  "Antonello da Messina",  "Antonello de Saliba",  "Antoniazzo Romano",  "Andrea Appiani",  "Alessandro Araldi",  "Giuseppe Arcimboldo",  "Pellegrino Aretusi",  "Mino Argento",  "Amico Aspertini",  "Gioacchino Assereto",  "Francesco Bacchiacca",  "Giovan Battista Gaulli",  "Sisto Badalocchio",  "Giuseppe Badaracco",  "Antonio Badile",  "Alesso Baldovinetti",  "Camillo Ballini",  "Cristiano Banti",  "Jacopo de' Barbari",  "Mario Bardi",  "Barna da Siena",  "Barnaba da Modena",  "Federico Barocci",  "Bartolo di Fredi",  "Fra Bartolomeo",  "Bartolomeo Veneto",  "Marco Basaiti",  "Marco Antonio Bassetti",  "Cesare Bassano",  "Francesco da Ponte",  "Francesco Bassano the Younger",  "Jacopo Bassano",  "Leandro Bassano",  "Lazzaro Bastiani",  "Pompeo Batoni",  "Domenico Beccafumi",  "Gentile Bellini",  "Giovanni Bellini",  "Jacopo Bellini",  "Luigi Benfatto",  "Ambrogio Bergognone",  "Bonaventura Berlinghieri",  "Berlinghiero Berlinghieri",  "Giuseppe Bertini",  "Francesco Bianchi (painter)",  "Francesco Galli Bibiena",  "Francesco Bissolo",  "Giovanni Battista Bissoni",  "Boccaccio Boccaccino",  "Giovanni Boccati",  "Giovanni Boccardi (painter)",  "Umberto Boccioni",  "Giovanni Boldini",  "Giovanni Antonio Boltraffio",  "Benedetto Bonfigli",  "Bonifacio Veronese",  "Giovanni Bonini",  "Bono da Ferrara",  "Francesco Bonsignori",  "Paris Bordone",  "Guido Borelli",  "Odoardo Borrani",  "Giuseppe Borsato",  "Andrea Boscoli",  "Erma Bossi",  "Carlo Bossoli",  "Giuseppe Bottero",  "Sandro Botticelli",  "Francesco Botticini",  "Raffaello Botticini",  "Donato Bramante",  "Bramantino",  "Agnolo Bronzino",  "Brancaleon",  "Buonamico Buffalmacco",  "Giuliano Bugiardini",  "Niccolò di Buonaccorso",  "Bernardino Butinone",  "Ludovico Buti",  "Vincenzo Cabianca",  "Camillo Cabutti",  "Guglielmo Caccia",  "Vicenzo Caccianemici",  "Giovanni Cadioli",  "Pio Caglieri",  "Giuseppe Calcia",  "Bartolommeo Calomato",  "Pietro Calzetta",  "Luca Cambiasi",  "Michele Cammarano",  "Bartolomeo da Camogli",  "Agostino Campanella",  "Galeazzo Campi",  "Vincenzo Campi",  "Canaletto",  
+             "Bartolomeo Caporali",  "Aliprando Caprioli",  "Domenico Caprioli",  "Antonio Capulongo",  "Cecco del Caravaggio",  "Marco Cardisco",  "Bartolomeo Carducci",  "Luca Carlevarijs",  "Giulio Carmignani",  "Fra Simone da Carnuli",  "Paolo Carosone",  "Agostino Carracci",  "Annibale Carracci",  "Ludovico Carracci",  "Caravaggio",  "Fernando Carcupino",  "Andrea Carlone",  "Giovanni Battista Carlone",  "Giovanni Bernardo Carlone",  "Domenico Carnovale",  "Vittore Carpaccio",  "Domenico Carpinoni",  "Rosalba Carriera",  "Felice Casorati",  "Stefano Cassiani",  "Andrea del Castagno",  "Raffaelle Castellini",  "Fabrizio Castello",  "Vincenzo Catena",  "Pasquale Cati",  "Paoluccio Cattamara",  "Giovanni Paolo Cavagna",  "Bernardo Cavallino",  "Giacomo Cavedone",  "Paolo Caylina the Younger",  "Rodolfo Ceccotti",  "Adriano Cecioni",  "Quinto Cenni",  "Giulia Centurelli",  "Giacomo Ceruti",  "Giovanni Maria Cerva",  "Tito Chelazzi",  "Giorgio de Chirico",  "Michele Ciampanti",  "Carlo Cignani",  "Giambettino Cignaroli",  "Cimabue",  "Marco Cingolani (painter)",  "Vincenzo Civerchio",  "Sigismondo Coccapani",  "Leonardo Coccorante",  "Colantonio",  "Piergiorgio Colautti",  "Michele Coltellini",  "Giacomo Coltrini",  "Cima da Conegliano",  "Jacopo Coppi",  "Leonardo Corona",  "Antonio da Correggio",  "Hermann David Salomon Corrodi",  "Niccolò Corso",  "Pietro da Cortona",  "Francesco del Cossa",  "Giovanni Costa (painter, born 1826)",  "Lorenzo Costa",  "Carlo Cozza",  "Giovanni Battista Crema",  "Daniele Crespi",  "Giovan Battista Crespi",  "Giuseppe Maria Crespi",  "Donato Creti",  "Carlo Crivelli",  "Vittore Crivelli",  "Baldassare Croce",  "Francesco Curradi",  "Bernardo Daddi",  "Pino Daeni",  "Ottaviano da Faenza",  "Vito D'Ancona",  "Cosmo D'Angeli",  "Daniele da Volterra",  "Giuseppe De Sanctis",  "Serafino De Tivoli",  "Giorgio De Vincenzi",  "Luigi Deleidi",  "Francesco Denanto",  "Beppe Devalle",  "Antonio DeVity",  "Fra Diamante",  "Carlo Dolci",  "Domenichino",  "Domenico di Bartolo",  "Domenico di Zanobi",  "Domenico Veneziano",  "Enrico Donati",  "Dosso Dossi",  "Giuseppe Drugman",  "Duccio",  "Giovanni Fattori",  "Martino Ferabosco",  "Floriano Ferramola",  "Defendente Ferrari",  "Gaudenzio Ferrari",  "Antonio Ferrigno",  "Domenico Fetti",  "Domenico Fiasella",  "Marcello Figolino",  "Francesco Filippini",  "Lavinia Fontana",  "Michele Foschini",  "Vincenzo Foppa",  "Marcantonio Franceschini",  "Francesco Francia",  "Giorgio Fuentes",  "Bernardino Fungai",  "Agnolo Gaddi",  "Taddeo Gaddi",  "Enrico Gamba",  "Francesco Gamba",  "Lattanzio Gambara",  "Salvatore Garau",  "Enrico Garff",  "Domenico Gargiulo",  
+             "Bartolomeo Gennari",  "Gentile da Fabriano",  "Artemisia Gentileschi",  "Orazio Gentileschi",  "Tommaso Gherardini",  "Davide Ghirlandaio",  "Domenico Ghirlandaio",  "Ridolfo Ghirlandaio",  "Giampietrino",  "Corrado Giaquinto",  "Camillo Gioja Barbera",  "Luca Giordano",  "Giorgione",  "Giotto di Bondone",  "Giovanni da Milano",  "Giovanni da Rimini",  "Giovanni d'Alemagna",  "Giovanni del Biondo",  "Giovanni di Paolo",  "Giovanni di ser Giovanni Guidi",  "Gerolamo Giovenone",  "Girolamo da Carpi",  "Giunta Pisano",  "Benozzo Gozzoli",  "Giovanni Benedetto Castiglione",  "Giuseppe Grisoni",  "Francesco Guardi",  "Gianantonio Guardi",  "Guercino",  "Amanzia Guérillot",  "Guido of Siena",  "Bartolomeo Guidobono",  "Renato Guttuso",  "Francesco Hayez",  "Domenico Induno",  "Gerolamo Induno",  "Innocenzo da Imola",  "Jacopo del Casentino",  "Girolamo Lamanna",  "Carlo Lamparelli",  "Giovanni Lanfranco",  "Bernardino Lanini",  "Pietro Lauri",  "Bice Lazzari",  "Gregorio Lazzarini",  "Achille Lega",  "Silvestro Lega",  "Achille Leonardi",  "Pietro Giovanni Leonori",  "Liberale da Verona",  "Gennesio Liberale",  "Giovanni Antonio Licinio",  "Ulvi Liegi",  "Cesare Ligario",  "Berto Linajuolo",  "Filippino Lippi",  "Filippo Lippi",  "Giacomo Lippi",  "Giovanni Battista Livizzani",  "Giovanni Agostino da Lodi",  "Barbara Longhi",  "Pietro Longhi",  "Francesco Longo Mancini",  "Ambrogio Lorenzetti",  "Pietro Lorenzetti",  "Paolo de Lorenzi",  "Lorenzo di Credi",  "Lorenzo Monaco",  "Lorenzo Veneziano",  "Lorenzo Lotto",  "Luca di Tommè",  "Bernardino Luini",  "Angelo Maccagnino",  "Enrico Maccioni",  "Macrino d'Alba",  "Mario Mafai",  "Aimo Maggi",  "Alessandro Magnasco",  "Bastiano Mainardi",  "Matilde Malenchini",  "Luigi Malice",  "Antonio Mancini",  "Bartolomeo Manfredi",  "Giovanni Mansueti",  "Andrea Mantegna",  "Carlo Maratta",  "Luigi Marchesi (painter)",  "Luigi Marengo",  "Margaritone d'Arezzo",  "Carlo Maria Mariani",  "Giovanni Maria Mariani",  "Michele Marieschi",  "Carlo Martini",  "Simone Martini",  "Guido Marzulli",  "Masaccio",  "Maso di Banco",  "Masolino da Panicale",  "Michele Mastellari",  "Master of the Bambino Vispo",  "Master of the Osservanza Triptych",  "Paolo de Matteis",  "Filippo Mazzola",  "Ludovico Mazzolino",  "Carla Carli Mazzucato",  "Pier Francesco Mazzucchelli",  "Master of the Bambino Vispo",  "Melozzo da Forlì",  "Francesco Melzi",  "Lippo Memmi",  "Vincenzo Meucci",  "Michelangelo",  "Vincenzo Milione",  "Amedeo Modigliani",  "Bartolomeo Montagna",  "Jacopo da Montagnana",  "Paolo Moranda Cavazzola",  "Giorgio Morandi",  "Domenico Morelli",  "Moretto da Brescia",  "Emma Moretto",  
+             "Giovan Battista Moroni",  "Quirizio di Giovanni da Murano",  "Nardo di Cione",  "Ottaviano Nelli",  "Neri di Bicci",  "Neroccio de' Landi",  "Niccolò di Liberatore",  "Emilio Notti",  "Pietro Novelli",  "Allegretto Nuzi",  "Marco d'Oggiono",  "Orcagna",  "Lelio Orsi",  "Pacino di Buonaguida",  "Paolo Pagani",  "Luigi Pagano",  "Arturo Pagliai",  "Eleuterio Pagliano",  "Gioacchino Pagliei",  "Arcangela Paladini",  "Palma il Giovane",  "Palma il Vecchio",  "Marco Palmezzano",  "Giovanni Paolo Panini",  "Paolo Veneziano",  "Alessandro Papetti",  "Napoleone Parisani",  "Parmigianino",  "Ferdinando Partini",  "Luigia Pascoli",  "Bartolomeo Passarotti",  "Domenico Passignano",  "Giovanni Antonio Pellegrini",  "Itala Pellegrino",  "Giuseppe Pellizza da Volpedo",  "Odoardo Perini",  "Perugino",  "Simone Peterzano",  "Vincenzo Petrocelli",  "Umberto Pettinicchio",  "Pietro Pezzati (artist)",  "Baldassare Peruzzi",  "Pesellino",  "Giovanni Piancastelli",  "Piero della Francesca",  "Piero di Cosimo",  "Giovanni Battista Piazzetta",  "Nicola di Pietro",  "Domenico Piola",  "Pinturicchio",  "Sebastiano del Piombo",  "Fausto Pirandello",  "Giuseppe Pirovani",  "Pisanello",  "Michelangelo Pittatore",  "Giambattista Pittoni",  "Karl Plattner",  "Antonio del Pollaiuolo",  "Piero del Pollaiuolo",  "Giovanni Pietro de Pomis",  "Giovanni dal Ponte",  "Pontormo",  "Antonio Porcelli",  "Francesco Porcia",  "Il Pordenone",  "Gregorio Porideo",  "Daniello Porri",  "Aniello Portio",  "Andrea Pozzo",  "Alessandro Prampolino",  "Ranunzio Prata",  "Luigi Premazzi",  "Mattia Preti",  "Pier Francesco Prina",  "Giulio Cesare Procaccini",  "Stefano Provenzali",  "Mario Puccini",  "Antonio Puglicochi",  "Giovanni Battista Quadrone",  "Prospero Rabaglio",  "Raffaele Rabbia",  "Ambrogio Raffaele",  "Domenico Rainaldi",  "Giovanni Battista Ramacciotti",  "Laudadio Rambaldo",  "Raphael",  "Francesco Redenti",  "Tommaso Redi (painter)",  "Bernardo Regoliron",  "Guido Reni",  "Cesare Reverdino",  "Angelo Ribossi",  
+             "Marco Ricchiedeo", "Giovanni Battista Ricci",  "Sebastiano Ricci",  "Antonio Riccianti",  "Galeazzo Rivelli",  "Ercole de' Roberti",  "Marietta Robusti",  "Pietro Ròi",  "Romanino",  "Giulio Romano",  "Alessandro Rontini",  "Salvator Rosa",  "Cosimo Rosselli",  "Rosso Fiorentino",  "Antonio Rotta",  "Guido Ruggeri",  "Benedetto Rusconi",  "Clemente Ruta",  "Pietro Ruzolone",  "Lorenzo Sabatini",  "Andrea Sacchi",  "Giorgio Salmoiraghi",  "Marco Sammartino",  "Domingo Maria Sanni",  "Sano di Pietro",  "Fabrizio Santafede",  "Santi di Tito",  "Giovanni Santi",  "Girolamo Santo",  "Carlo Saraceni",  "Giuseppe Sartori",  "Andrea del Sarto",  "Sassetta",  "Giovanni Battista Salvi da Sassoferrato",  "Girolamo Savoldo",  "Francesco Scarpinato",  "Bartolomeo Schedoni",  "Alessandro Scorzoni",  "Antonino Sartini",  "Luigi Scaffai",  "Scipione (Gino Bonichi)",  "Giovanni Segantini",  "Jacopo da Sellaio",  "Luigi Serena",  "Ernesto Serra",  "Andrea Sguazella",  "Luca Signorelli",  "Telemaco Signorini",  "Nicola Simbari",  "Salvatore Simoncini",  "Simone dei Crocifissi",  "Mario Sironi",  "Sodoma",  "Andrea Solari",  "Giuseppe Solenghi",  "Francesco Solimena",  "Domenico Someda",  "Napoleone Sommaruga",  "Lionello Spada",  "Micco Spadaro",  "Giovanni Martino Spanzotti",  "Spinello Aretino",  "Francesco Squarcione",  "Giovanni Stanchi",  "Gherardo Starnina",  "Stefano da Verona",  "Bernardo Strozzi",  "Francesco Tacconi",  "Taddeo di Bartolo",  "Spurius Tadius",  "Giovanni Temini",  "Giovanni Battista Tiepolo",  "Giovanni Domenico Tiepolo",  "Tintoretto",  "Benvenuto Tisi",  "Titian",  "Antonio Tognone",  "Giulio Tonduzzi",  "Bartolommeo Torre",  "Francesco Traballesi",  "Gaspare Traversi",  "Giacomo Trécourt",  "Euclide Trotti",  "Giovanni Maria Tucci",  "Cosimo Tura",  "Paolo Uccello",  "Ugolino di Nerio",  "Perino del Vaga",  "Andrea Vanni",  "Tanzio da Varallo",  "Giorgio Vasari",  "Francesco Veau",  "Giovanni de' Vecchi",  "Benedetto Velli",  "Giovanni Vendramini",  "Giuseppe Vermiglio",  "Filippo da Verona",  "Niccolò Da Verona",  "Paolo Veronese",  "Andrea del Verrocchio",  "Francesco Vicentino",  "Leonardo da Vinci",  "Lauretta Vinciarelli",  "Jacopo Vignali",  "Vitale da Bologna",  "Matteo di Vittore",  "Bernardino Vitulini",  "Alvise Vivarini",  "Antonio Vivarini",  "Bartolomeo Vivarini",  "Antonio Diego Voci",  "Vincenzo Volpe",  "Giovanni Battista di Pietro di Stefano Volponi",  "Carlo Wostry",  "Alessandro Zaffonato",  "Domenico Zampieri",  "Federico Zandomeneghi",  "Giuseppe Miti Zanetti",  "Bernardo Zenale",  "Marco Zoppo",  "Francesco Zuccarelli",  "Federico Zuccari",  "Francesco Zugno",  "Sergio Zanni"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_artisti.html')
+
+
+# In[ ]:
+
+
+#LETTERATI ITALIANI
+descrizione = "Letterati italiani"
+searchfor = ["Crescenzo Alatri",  "Attilio Albergoni",  "Sibilla Aleramo",  "Vittorio Alfieri",  "Dante Alighieri",  "Magdi Allam",  "Ernesto Aloia",  "Corrado Alvaro",  "Pasquale Amati",  "Niccolò Ammaniti",  "Elisa S. Amore",  "Cecco Angiolieri",  "Giulio Angioni",  "Andrea da Grosseto",  "Ludovico Ariosto",  "Giovanni Arpino",  "Antonia Arslan",  "Devorà Ascarelli",  "Emma Baeri",  "Andrea Bajani",  "Alfredo Balducci",  "Barbara Baraldi",  "Ermolao Barbaro",  "Ermolao Barbaro",  "Francesco Barbaro",  "Giosafat Barbaro",  "Marco Barbaro",  "Alessandro Baricco",  "Giorgio Bassani",  "Cesare Beccaria",  "Stefano Benni",  "Pietro Bembo",  "Mario Benzing",  "Giuseppe Berto",  "Enzo Bettiza",  "Enzo Biagi",  "Luciano Bianciardi",  "Luther Blissett",  "Giovanni Boccaccio",  "Matteo Maria Boiardo",  "Arrigo Boito",  "Camillo Boito",  "Franco Bolelli",  "Vitaliano Brancati",  "Enrico Brizzi",  "Giordano Bruno",  "Gesualdo Bufalino",  "Aldo Busi",  "Dino Buzzati",  "Achille Giovanni Cagna",  "Roberto Calasso",  "Italo Calvino",  "Andrea Camilleri",  "Dino Campana",  "Manuela Campanelli",  "Achille Campanile",  "Luigi Capuana",  "Enrichetta Caracciolo",  "Alberto Caramella",  "Giosuè Carducci",  "Nadia Cavalera",  "Gianni Celati",  "Benvenuto Cellini",  "Vincenzo Cerami",  "Guido Cervo",  "Saveria Chemotti",  "John Ciardi",  "Pietro Citati",  "Carlo Collodi",  "Vincenzo Consolo",  "Matteo Corradini",  "Benedetto Croce",  "Jacobus de Voragine",  "Jacopone da Todi",  "Gabriele D'Annunzio",  "Massimo D'Azeglio",  "Edmondo De Amicis",  "Giacomo Debenedetti",  "Andrea De Carlo",  "Grazia Deledda",  "Massimo del Pizzo",  "Silvana De Mari",  "Sergio De Santis",  "Raffaella de' Sernigi",  "Paola Drigo",  "Umberto Eco",  "Muzi Epifani",  "Valerio Evangelisti",  "Julius Evola",  "Francesco Falconi",  "Giorgio Faletti",  "Oriana Fallaci",  "Beppe Fenoglio",  "Ennio Flaiano",  "Dario Fo",  "Marcello Fois",  "Antonio Fogazzaro",  "Ugo Foscolo",  "Bruno Forte",  "Carlo Fruttero",  "Carlo Emilio Gadda",  "Barbara Gallavotti",  "Natalia Ginzburg",  "Paolo Giordano",  "Cinzia Giorgio",  "Raffaello Giovagnoli",  "Guglielmo il Giuggiola",  "Giovanni Battista Giraldi",  "Carlo Goldoni",  "Corrado Govoni",  "Guido Gozzano",  "Giovannino Guareschi",  "Robert Germaine",  "Tonino Guerra",  "Petrus Haedus",  "Ibn Hamdis",  "Fleur Jaeggy",  "Tommaso Landolfi",  "Brunetto Latini",  "Bruno Leoni",  "Giacomo Leopardi",  "Menotti Lerro",  "Franco Loi",  "Carlo Levi",  "Primo Levi",  "Giuseppe Lombardo Radice",  "Carlo Lucarelli",  "Emilio Lussu",  "Niccolò Machiavelli",  "Alessandra Macinghi Strozzi",  "Claudio Magris",  "Maria Majocchi",  "Clementina Laura Majocchi",  "Curzio Malaparte",  "Marco Malvaldi",  "Valerio Massimo Manfredi",  "Giorgio Manganelli",  "Fabio Maniscalco",  "Gianna Manzini",  "Alessandro Manzoni",  "Dacia Maraini",  "Fosco Maraini",  "Diego Marani",  "Lucrezia Marinella",  "Stefano Massini",  "Chiara Matraini",  "Margaret Mazzantini",  "Carlo Mazzoni",  "Melania Mazzucco",  "Fulvio Melia",  "Maria Messina",  "Franco Mimmi",  "Federico Moccia",  "Grazyna Miller",  "Massimo Mongai",  "Valeria Montaldi",  "Eugenio Montale",  "Maria Montessori",  "Beatrice Monroy",  "Giuliana Morandini",  "Elsa Morante",  "Marta Morazzoni",  "Olympia Morata",  "Alberto Moravia",  "Antonio Moresco",  "Anna Radius Zuccari",  "Ada Negri",  "Ippolito Nievo",  "Aldo Palazzeschi",  "Giancarlo Pallavicini",  "Angeliki Palli",  "Melissa Panarello",  "Giovanni Papini",  "Giovanni Pascoli",  "Pier Paolo Pasolini",  "Cesare Pavese",  "Roberto Pazzi",  "Silvio Pellico",  "Danilo Pennone",  "Frank Peretti",  "Giovanni Pico della Mirandola",  "Tommaso Pincio",  "Luigi Pirandello",  "Fernanda Pivano",  "Joseph Pivato",  "Angelo Poliziano",  "Marco Polo",  "Vasco Pratolini",  "Hugo Pratt",  "Mario Praz",  "Ottavio Profeta",  "Luigi Pulci",  "Roberto Quaglia",  "Salvatore Quasimodo",  "Lidia Ravera",  "Mario Rigoni Stern",  "Gianni Rodari",  "Lalla Romano",  "Emanuela Da Ros",  "Umberto Saba",  "Emilio Salgari",  "Rubino Romeo Salmonì",  "Emilia Salvioni",  "Alberto Savinio",  "Leonardo Sciascia",  "Matilde Serao",  "Beppe Severgnini",  "Ignazio Silone",  "Mario Soldati",  "Mario Spezi",  "Italo Svevo",  "Roberto Saviano",  "Antonio Tabucchi",  "Susanna Tamaro",  "Torquato Tasso",  "Tiziano Terzani",  "Roberto Tiraboschi",  "Giuseppe Tomasi di Lampedusa",  "Fulvio Tomizza",  "Pier Vittorio Tondelli",  "Marco Travaglio",  "Luigi Ugolini",  "Giuseppe Ungaretti",  "Giorgio van Straten",  "Giovanni Verga",  "Grazia Verasani",  "Giuseppe Vergani",  "Sandro Veronesi",  "Anna Vertua Gentile",  "Mitì Vigliero Lami",  "Simona Vinci",  "Ottavia Vitagliano",  "Elio Vittorini",  "Paolo Volponi",  "Wu Ming",  "Enrica Zunic"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_letterati.html')
+
+
+# In[ ]:
+
+
+#VITTIME DI MAFIA
+descrizione = "Vittime della mafia"
+searchfor = ["Giorgio Ambrosoli",  "Rita Atria",  "Paolo Borsellino",  "Antonino Cassarà",  "Rocco Chinnici",  "Carlo Alberto Dalla Chiesa",  "Giovanni Falcone",  "Francesco Fortugno",  "Boris Giuliano",  "Libero Grassi",  "Giuseppe Impastato",  "Giuseppe Insalaco",  "Pio La Torre",  "Rosario Livatino",  "Piersanti Mattarella",  "Beppe Montana",  "Don Giuseppe Puglisi",  "Antonino Scopelliti",  "Cesare Terranova",
+            "Carlo Alberto Dalla Chiesa",  "Cesare Terranova",  "Mauro De Mauro",  "Mario Francese",  "Boris Giuliano",  "Giorgio Ambrosoli",  "Piersanti Mattarella",  "Pino Puglisi",  "Giovanni Falcone",  "Paolo Borsellino",  "Joe Petrosino",  "Bernardino Verro",  "Emanuele Notarbartolo",  "Giovanni Spampinato",  "Pippo Fava",  "Mauro Rostagno",  "Pietro Scaglione",  "Gaetano Cappiello",  "Giuseppe Russo",  "Ugo Triolo",  "Salvatore Castelbuono",  "Filadelfio Aparo",  "Calogero Di Bona",  "Peppino Impastato",  "Don Pino Puglisi",  "Luis Carlos Galán",  "Gulshan Kumar",  "Pierre Michel",  "Ivo Pukanić"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_mafia.html')
+
+
+# In[ ]:
+
+
+#SAVOIA
+descrizione = "Savoia"
+searchfor = ["Carlo Felice",  "Carlo Alberto",  "Vittorio Emanuele II", "Umberto I",  "Vittorio Emanuele III",  "Umberto II",  "Savoia",
+            "Vittorio Emanuele secondo",  "Umberto primo",  "Vittorio Emanuele terzo",  "Umberto secondo",  "Regina Margherita"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_savoia.html')
+
+
+# In[ ]:
+
+
+#SPETTACOLO
+descrizione = "Personaggi dello spettacolo"
+searchfor = ["Roberto Benigni",  "Federico Fellini",  "Sophia Loren",  "Alberto Sordi",  "Raffaella Carrà",  "Maurizio Costanzo",  "Eduardo De Filippo",  "Dario Fo",  "Giorgio Strehler",  "Luciano Pavarotti",  "Mina",  "Vasco Rossi",  "Marcello Mastroianni",  "Vittorio Gassman",  "Nino Manfredi",  "Ugo Tognazzi",  "Totò",  "Anna Magnani",  "Monica Vitti",  "Virna Lisi",  "Claudia Cardinale",  "Gina Lollobrigida",  "Ornella Muti",  "Monica Bellucci",  "Mariangela Melato",  "Silvana Mangano",  "Sabrina Ferilli",  "Paola Cortellesi",  "Elena Sofia Ricci",  "Franca Valeri",  "Alida Valli",  "Stefania Sandrelli",  "Margherita Buy",  "Carlo Verdone",  "Massimo Troisi",  "Roberto Rossellini",  "Luchino Visconti",  "Pier Paolo Pasolini",  "Sergio Leone",  "Ennio Morricone",  "Lucio Dalla",  "Fabrizio De André",  "Giorgio Gaber",  "Renato Carosone",  "Nino Rota",  "Giuseppe Tornatore",  "Bernardo Bertolucci",  "Ettore Scola",  "Mario Monicelli",  "Domenico Modugno",  "Mina Mazzini",  "Patty Pravo",  "Mia Martini",  "Rino Gaetano",  "Luciano Pavarotti",  "Andrea Bocelli",  "Vittorio De Sica",  "Federico Fellini",  "Michelangelo Antonioni",  "Piero Umiliani",  "Nanni Moretti",  "Marco Ferreri",  "Gianni Morandi",  "Lucio Battisti",  "Franco Battiato",  "Zucchero Fornaciari",  "Laura Pausini",  "Eros Ramazzotti"]
+total_comuni_grouped = get_aggregazione_comuni_con_filtro(searchfor)
+gpd_geo_comuni, vie_per_comune = calcola_metriche_comuni_in_gdp(total_comuni_grouped, comuni)
+gpd_geo_province, vie_per_provincia = calcola_metriche_province_in_gdp(vie_per_comune, province)
+metrica = 'Percentuale vie di interesse'
+m = ottieni_grafico(gpd_geo_province, descrizione, metrica)
+m.save('./output/province_spettacolo.html')
+
+
+# In[34]:
+
+
+searchfor = ['Pietro Nenni', 'Giorgio Amendola', 'Ugo La Malfa', "Alcide De Gasperi", 'Ugo la Malfa', "Alcide de Gasperi"]
+
+
+# In[33]:
+
+
+searchfor
+
+
+# In[ ]:
+
+
+
+
